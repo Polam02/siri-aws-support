@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: My API Gateway and Lambda function
+Parameters:
+  Environment:
+    Description: Define environment to create API and Lambda
+    Type: String
+    Default: testv2
+    AllowedValues:
+      - test
+      - testv2
+      - dev
+      - uat
+      - prod
+  apiGatewayName:
+    Type: String
+    Default: LambdaMicroservice
+  apiGatewayStageName:
+    Type: String
+    Default: prod
+  lambdaFunctionName:
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9]+[a-zA-Z0-9-]+[a-zA-Z0-9]+$'
+    Default: SENSICalcLambda
+Resources:
+  apiGateway:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Join 
+        - ''
+        - - !Ref apiGatewayName
+          - _
+          - !Ref Environment
+    Description: My API Name
+  apiGatewayRootMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      ApiKeyRequired: 'true'
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        IntegrationHttpMethod: ANY
+        Type: AWS_PROXY
+        Uri: !Sub 
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt 
+              - lambdaFunction
+              - Arn
+      ResourceId: !Ref apiGatewayResource
+      RestApiId: !Ref apiGateway
+  apiGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref apiGateway
+      ParentId: !GetAtt 
+        - apiGateway
+        - RootResourceId
+      PathPart: !Join 
+        - ''
+        - - !Ref lambdaFunctionName
+          - _
+          - !Ref Environment
+  apiGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - apiGatewayRootMethod
+    Properties:
+      RestApiId: !Ref apiGateway
+      StageName: !Ref apiGatewayStageName
+  usagePlan:
+    Type: 'AWS::ApiGateway::UsagePlan'
+    DependsOn:
+      - apiGatewayDeployment
+    Properties:
+      ApiStages:
+        - ApiId: !Ref apiGateway
+          Stage: !Ref apiGatewayStageName
+      Description: SENSICalCLambda and LambdaMicroService usage plan
+      Throttle:
+        BurstLimit: 20
+        RateLimit: 10
+      UsagePlanName: !Join 
+        - ''
+        - - !Ref lambdaFunctionName
+          - _
+          - !Ref Environment
+  lambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: configbucket-access-key-rotation-v9
+        S3Key: FunctionCode.zip
+      Description: My function
+      FunctionName: !Join 
+        - ''
+        - - !Ref lambdaFunctionName
+          - _
+          - !Ref Environment
+      Environment:
+        Variables:
+          SENSI_RESULTS_DIR: /tmp/sensi
+          SENSI_STAGE: !Ref Environment
+          VAULT_ADDR: 'http://ec2-54-67-66-51.us-west-1.compute.amazonaws.com'
+          VAULT_TOKEN: 83ec758e-acf7-4510-9212-10a169fb3647
+      Handler: LambdaHandler.lambda_handler
+      MemorySize: 3008
+      Role: !GetAtt 
+        - lambdaIAMRole
+        - Arn
+      Runtime: python3.9
+      Timeout: 900
+  lambdaApiGatewayInvoke:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt 
+        - lambdaFunction
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub >-
+        arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/*/*/${lambdaFunction}
+  lambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Effect: Allow
+                Resource:
+                  - !Sub >-
+                    arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${lambdaFunctionName}:*
+          PolicyName: lambdaPolicy
+  lambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${lambdaFunctionName}'
+      RetentionInDays: 90
+  CloudFrontOriginRequestPolicy:
+    Type: 'AWS::CloudFront::OriginRequestPolicy'
+    Properties:
+      OriginRequestPolicyConfig:
+        Comment: Policy for CustomCFDHeaderPolicy Testing
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - x-api-key
+        Name: CustomCFDHeaderPolicy
+        QueryStringsConfig:
+          QueryStringBehavior: all
+  CloudFrontCustomDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    DependsOn:
+      - CloudFrontOriginRequestPolicy
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - abc.dn-tech.co
+          - xyz.dn-tech.co
+        Comment: Allow http2 protocol for API Gateway
+        DefaultCacheBehavior:
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: !Ref CloudFrontOriginRequestPolicy
+          TargetOriginId: apiGateway
+          ViewerProtocolPolicy: https-only
+        Enabled: true
+        HttpVersion: http2
+        ViewerCertificate:
+          AcmCertificateArn: >-
+            arn:aws:acm:us-east-1:058172051331:certificate/18fbab5b-4b6a-43f7-8920-0ea2073140f2
+          SslSupportMethod: vip
+          MinimumProtocolVersion: TLSv1
+        Origins:
+          - CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+            DomainName: !Join 
+              - ''
+              - - !Ref apiGateway
+                - .execute-api.
+                - !Sub '${AWS::Region}.amazonaws.com'
+            OriginPath: !Join 
+              - ''
+              - - /
+                - !Ref apiGatewayStageName
+            Id: apiGateway
+  DNSRecordSetCreation:
+    Type: 'AWS::Route53::RecordSet'
+    DependsOn: CloudFrontCustomDistribution
+    Properties:
+      HostedZoneId: Z01556251MCO4J7NZPDJL
+      Name: test.dn-tech.co
+      ResourceRecords:
+        - !GetAtt 
+          - CloudFrontCustomDistribution
+          - DomainName
+      TTL: '300'
+      Type: CNAME
+Outputs:
+  apiGatewayInvokeURL:
+    Value: !Sub >-
+      https://${apiGateway}.execute-api.${AWS::Region}.amazonaws.com/${apiGatewayStageName}
+  lambdaArn:
+    Value: !GetAtt 
+      - lambdaFunction
+      - Arn
