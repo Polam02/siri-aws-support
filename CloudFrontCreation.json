@@ -1,0 +1,71 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Resources": {
+        "MyLoadBalancer" : {
+            "Type" : "AWS::ElasticLoadBalancing::LoadBalancer",
+            "Properties" : {
+                "Subnets" : [ "subnet-63f28804", "subnet-88e66fb6" ],
+                "Listeners" : [ {
+                    "LoadBalancerPort" : "80",
+                    "InstancePort" : "80",
+                    "Protocol" : "HTTP"
+                } ]
+            }
+        },
+        "CloudFrontOriginRequestPolicy":{
+            "Type" : "AWS::CloudFront::OriginRequestPolicy",
+            "Properties" : {
+                "OriginRequestPolicyConfig" : {
+                    "Comment" : "Policy for CustomCFDHeaderPolicy Testing",
+                    "CookiesConfig" : {
+                        "CookieBehavior" : "all"
+                    },
+                    "HeadersConfig" : {
+                        "HeaderBehavior" : "whitelist",
+                        "Headers" : [ "x-api-key" ]
+                    },
+                    "Name" : "CustomCFDHeaderPolicy",
+                    "QueryStringsConfig" : {
+                        "QueryStringBehavior" : "all"
+                    }
+                }
+    }
+        },
+        "CloudFrontCustomDistribution":{
+            "Type" : "AWS::CloudFront::Distribution",
+            "Properties" : {
+                "DistributionConfig" : {
+                    "Aliases" : [ "abc.dn-tech.co", "xyz.dn-tech.co" ],
+                    "Comment" : "Allow http2 protocol for API Gateway",
+                    "DefaultCacheBehavior": {
+                        "CachePolicyId" : "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+                        "OriginRequestPolicyId" : {"Ref": "CloudFrontOriginRequestPolicy"},
+                        "TargetOriginId" : "apiGateway",
+                        "ViewerProtocolPolicy" : "https-only"
+                    },
+                    "Enabled" : true,
+                    "HttpVersion" : "http2",
+                    "ViewerCertificate": {
+                        "AcmCertificateArn" : "arn:aws:acm:us-east-1:058172051331:certificate/18fbab5b-4b6a-43f7-8920-0ea2073140f2",
+                        "SslSupportMethod": "vip",
+                        "MinimumProtocolVersion": "TLSv1"
+                    },
+                    "Origins" : [ 
+                        {
+                            "CustomOriginConfig" : {
+                                "OriginProtocolPolicy" : "https-only"
+                            },
+                            "DomainName": {
+                                "Fn::GetAtt": [
+                                    "MyLoadBalancer",
+                                    "DNSName"
+                                ]
+                            },
+                            "Id": "apiGateway"
+                        }
+                     ]
+                }
+              }
+          }
+    }
+}
