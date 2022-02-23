@@ -21,4 +21,4 @@ If required, in Debug Mode
 
 
 ## Sample Usage
-![alt text](https://github.com/duggu-reddy/siri-aws-support/DeployScript/deploy_script_image.JPG)
+![alt text](https://github.com/duggu-reddy/siri-aws-support/blob/main/DeployScript/deploy_script_image.JPG)
