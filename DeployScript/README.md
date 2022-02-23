@@ -8,6 +8,8 @@
 ## Inputs
 Input deploy instruction file
 If any value not passed in runtime script will be exit.
+Sample Input File
+![alt text](https://github.com/duggu-reddy/siri-aws-support/blob/main/DeployScript/Sample_inputFile.JPG)
 
 ## Usage
 Assign required permission 
