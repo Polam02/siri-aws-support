@@ -1,0 +1,2 @@
+/home/cloudshell-user/source_folder/file1.txt,/home/cloudshell-user/destination_folder
+/home/cloudshell-user/source_folder/file2.log,/home/cloudshell-user/destination_folder/file1.txt
