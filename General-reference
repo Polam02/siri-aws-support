@@ -1,0 +1,441 @@
+pipeline {
+    agent { label 'windows' }
+
+    // creating environment variables to make jenkinsfile declarative
+    environment {
+        ARTIFACTORY_CREDS = credentials('svcartifactorycicd')
+        def Artifactory_Bucket = "Local-PDI-Artifacts"
+	    def isEmailToVeracode = false
+        def securityEmail = "AppSec@pilottravelcenters.com" 
+	    def Veracode_File = ""
+	    def notifyEmail = "c54675bc.pilotflyingj.onmicrosoft.com@amer.teams.ms" 
+    }
+
+    stages {
+        // grab the environment variables, so I know what we're working with
+        stage('Echo Environment Variables') {
+            steps {
+                // output env variables
+                echo "ENVIRONMENT: ${environment}"
+                echo "Version: ${version}"
+                echo "IS_RELEASE_CANDIDATE: ${isReleaseCandidate}"
+                echo "GITHUB_BRANCH: ${branch}"
+                echo "EMAIL: ${email}"
+                echo "WORKSPACE: ${WORKSPACE}"
+                echo "BUILD_NUMBER: ${BUILD_NUMBER}"
+                echo "Application_name: ${Application_Name}"
+                echo "Artifactory_Bucket: ${Artifactory_Bucket}"
+                echo "Artifactory_File: ${Application_Name}-For-Artifactory.zip"
+                // Solution Files and Paths for .NET
+                echo "Framework_Solution_File = ${Framework_Solution_File}"
+                echo "Framework_Build_Files_Path = ${Framework_Build_Files_Path}"
+                // Set Server Paths for the Copy-Item Command
+                echo "Dev_Framework_Server_Path = ${Dev_Framework_Server_Path}"
+                echo "Qa_Framework_Server_Path = ${Qa_Framework_Server_Path}"
+                echo "Prod_Framework_Server_Path = ${Prod_Framework_Server_Path}"
+            }           
+        }
+        stage('Empty Field Check') {
+            steps {
+                script {
+                    if (params.Dev_Framework_Server_Path != ''){
+                    echo "Dev_Framework_Server_Path exists: ${Dev_Framework_Server_Path}" 
+                    }
+                    else {
+                    error("Dev_Framework_Server_Path is required")
+                    }
+                    /*
+                    if(params.Veracode_File==null)
+                    {
+                        Veracode_File="${Application_Name}-For-Veracode.zip"
+                    }
+                    else
+                    {
+                        Veracode_File=params.Veracode_File
+                    }
+                    
+                    echo "Veracode_File = ${Veracode_File}"
+                    */
+                }
+            }
+        }
+        stage('Checkout Git Branch') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: '*/${branch}']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '66901246-9eff-4f83-8ed7-a68448d1f64b', url: 'https://github.com/PilotFlyingJ/${Application_Name}.git']]])            }
+        }
+        
+        // SQ for code quality, MSBuild/dotnet debug build to verify solution is ready for deployment.
+        stage ('SonarQube Scan, MSBuild, dotnet build for Debug') {
+            when {
+                expression { params.environment == 'dev' }
+            }
+            steps {
+                // send code to SonarQube for analysis
+                withSonarQubeEnv('SonarQube Prod') {
+		            bat "SonarScanner.MSBuild.exe begin /k:${Application_Name} /n:${Application_Name} /v:${Application_Name}-${BUILD_NUMBER} /d:sonar.host.url=%SONAR_HOST_URL% /d:sonar.login=%SONAR_AUTH_TOKEN%"
+                    bat "nuget restore -SolutionDirectory ${WORKSPACE} -PackagesDirectory ${WORKSPACE}\\Packages -Source https://pfjartifacts.pilotcorp.net:8443/artifactory/api/nuget/PFJ-NuGet-Packages ${Framework_Solution_File}"
+		            bat """MSBuild.exe -property:Configuration=Release ${Framework_Solution_File}"""
+			
+		            // Use dotnet restore (publish optional) when dealing with multiple solution files
+		            bat "SonarScanner.MSBuild.exe end /d:sonar.login=%SONAR_AUTH_TOKEN%"
+                }
+
+                timeout(time: 1, unit: 'HOURS') { // Just in case something goes wrong, pipeline will be killed after a timeout
+                    script {
+                        def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
+                             
+                        if (qg.status != 'OK') {
+				            if(params.isReleaseCandidate=="true"){
+					            //to block next stage and show graphical box as red
+					            //error "Quality Gate for code scan failure: ${qg.status}" 
+						    
+					            //to non-block next stage and show graphical box as yellow (unstable)						    
+					            unstable("Quality Gate for code scan failure: ${qg.status}")						    
+				            }
+				            else{
+					            //to non-block next stage and show graphical box as yellow (unstable)
+					            unstable("Quality Gate for code scan failure: ${qg.status}")
+                            }
+                        }  
+                    }
+                }  
+            }
+        }
+
+        // Check if the build version has already been created. If so, fail the job. We don't want versions over-written
+        stage('Validate Build Version') {
+            when {
+                expression { params.environment == 'dev' && isReleaseCandidate == 'true' }
+            }
+            agent any
+            steps {
+                script {
+                    versionExists = 'false'
+                    try {
+                        sh "curl -u'$ARTIFACTORY_CREDS_USR':'$ARTIFACTORY_CREDS_PSW' --fail --head 'https://pfjartifacts.pilotcorp.net:8443/artifactory/${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}.zip'"
+                        versionExists = 'true'
+                        echo "Version ${version} found in artifactory. Create a new version"
+                        currentBuild.result = 'FAILURE'
+                    }
+                    catch (exc) {
+                        echo "Version ${version} not found. Success"
+                        currentBuild.result = 'SUCCESS'
+                    }
+                    echo "RESULT: ${currentBuild.result}"
+                }
+            }
+        }
+
+        // SQ for code quality, MSBuild/dotnet release build to verify solution is ready for deployment. These builds will generate .dll and .pdb files that we send to Veracode
+        stage ('SonarQube Scan, MSBuild, dotnet build for Release') {
+            when {
+                expression { params.environment == 'dev' && isReleaseCandidate == 'true' }
+            }
+            steps {
+                // send code to SonarQube for analysis
+                withSonarQubeEnv('SonarQube Prod') {
+		            bat "SonarScanner.MSBuild.exe begin /k:${Application_Name} /n:${Application_Name} /v:${Application_Name}-${BUILD_NUMBER} /d:sonar.host.url=%SONAR_HOST_URL% /d:sonar.login=%SONAR_AUTH_TOKEN%"
+                    bat "nuget restore -SolutionDirectory ${WORKSPACE} -PackagesDirectory ${WORKSPACE}\\Packages -Source https://pfjartifacts.pilotcorp.net:8443/artifactory/api/nuget/PFJ-NuGet-Packages ${Framework_Solution_File}"
+                    bat """MSBuild.exe -property:Configuration=Release ${Framework_Solution_File}"""
+                    
+                    // Use dotnet restore (publish optional) when dealing with multiple solution files
+		            bat "SonarScanner.MSBuild.exe end /d:sonar.login=%SONAR_AUTH_TOKEN%"
+                }
+
+                timeout(time: 1, unit: 'HOURS') { // Just in case something goes wrong, pipeline will be killed after a timeout
+                    script {
+                        def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
+                             
+                        if (qg.status != 'OK') {
+				            if(params.isReleaseCandidate=="true"){
+					            //to block next stage and show graphical box as red
+					            //error "Quality Gate for code scan failure: ${qg.status}"
+						    
+						    //to non-block next stage and show graphical box as yellow (unstable)
+						    unstable("Quality Gate for code scan failure: ${qg.status}")
+						    
+				            }
+				            else{
+					            //to non-block next stage and show graphical box as yellow (unstable)
+					            unstable("Quality Gate for code scan failure: ${qg.status}")
+                            }
+                        }  
+                    }
+                }    
+            }
+        }
+	    
+	
+        // Release artifacts are pushed to Artifactory. Once approved, we pull those artifacts down to be deployed to qa and/or prod
+  	    stage ('Publish to Artifactory IRC=False') {
+            when {
+                expression { params.environment == 'dev' && isReleaseCandidate == 'false' }
+            }
+            steps {
+                // Documentation for artifactory https://www.jfrog.com/confluence/display/RTF/Scripted+Pipeline+Syntax
+                powershell "Compress-Archive -Path .\\PDI* -DestinationPath ${Application_Name}-For-Artifatory.zip -Update"
+                script {
+                    def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+                    def uploadSpec = """{
+                        "files": [
+                            {
+                            "pattern": "${Application_Name}-For-Artifatory.zip",
+                            "target": "${Artifactory_Bucket}/${Application_Name}-Local/0.0.1/${Application_Name}.zip"
+                            }
+                        ]
+                    }"""
+                    server.upload spec: uploadSpec
+                }
+            }    
+  	    }
+
+  	    stage ('Publish to Artifactory IRC=True') {
+            when {
+                expression { params.environment == 'dev' && isReleaseCandidate == 'true' }
+            }
+            steps {
+                // Documentation for artifactory https://www.jfrog.com/confluence/display/RTF/Scripted+Pipeline+Syntax
+                powershell "Compress-Archive -Path .\\PDI* -DestinationPath ${Application_Name}-For-Artifatory.zip -Update"
+		     // veracode scan submission for both Core and Framework .dll files
+                powershell "Get-ChildItem -Path .\\${Framework_Build_Files_Path}\\PDI* -Exclude Microsoft*, System* | Compress-Archive -DestinationPath ${WORKSPACE}\\${Application_Name}-For-Veracode.zip -Update"
+                script {
+                    def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+                    def uploadSpec = """{
+                        "files": [
+                            {
+                            "pattern": "${Application_Name}-For-Artifatory.zip",
+                            "target": "${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}.zip"
+                            }
+                        ]
+                    }"""
+                    server.upload spec: uploadSpec
+
+					echo "Uploading Veracode zip to Artifactory Store"                            
+                    def uploadSpecVCode = """{
+                        "files": [
+                            {
+                            "pattern": "${Application_Name}-For-Veracode.zip",
+                            "target": "${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}-For-Veracode.zip"
+                            }
+                        ]
+                    }"""
+                    server.upload spec: uploadSpecVCode
+                }
+            }    
+  	    }
+        // 11 Nov 2020: Had conversation with Travis Donell regarding issuing more Veracode Licenses for the PDI Projects for .NET Core and .NET Framework and the limit has been
+	// exceeded and no more Veracode scans should be issued.  Updating code below from 'dev' to 'dev1' to stop accessing this block of code for Veracode. 
+        
+        stage ('Submit Veracode Scan') {
+            when {
+                expression { params.environment == 'dev' && isReleaseCandidate == 'true' && versionExists == 'false' }
+            }
+	    agent any
+            steps {
+			script {
+                	try {
+					 def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+						def downloadSpec = """{
+						"files": [
+							{
+							"pattern": "${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}-For-Veracode.zip", 
+							"target": "./"
+							}
+						]
+						}"""
+						server.download spec: downloadSpec
+					sh "ls -l"
+					echo "Sending code to Veracode"
+			
+				withCredentials([usernamePassword(credentialsId: 'veracode-credentials', passwordVariable: 'vpass', usernameVariable: 'vuser')]) {
+						sh "java -jar ${VERACODE_API_PATH} -action UploadAndScan -vid $vuser -vkey $vpass -appname ${Application_Name} -createprofile false -criticality 'VeryHigh' -version ${version} -autoscan true -filepath ${WORKSPACE}/${Application_Name}/${version}/${Application_Name}-For-Veracode.zip"
+					//veracode applicationName: params.Application_Name, canFailJob: true, criticality: 'VeryHigh', debug: true, fileNamePattern: '', replacementPattern: '', sandboxName: '', scanExcludesPattern: '', scanIncludesPattern: '', scanName: '${version}', teams: '', uploadExcludesPattern: '', uploadIncludesPattern: '${Application_Name}-For-Veracode.zip', useIDkey: true, vid: vuser, vkey: vpass, vpassword: '', vuser: ''
+						}
+			} catch (err) {
+			echo err.getMessage()
+			echo "Veracode Scan API Failed. Email with zip link will be sent to AppSec@pilottravelcenters.com"
+			isEmailToVeracode = true
+			unstable("Veracode Scan API Failed. Email with zip link will be sent to AppSec@pilottravelcenters.com")
+			}
+		}
+            }
+        }
+        
+        stage ('Deploy to Dev') {
+            when {
+                expression { params.environment == 'dev' }
+            }
+            steps {
+                // documentation for artifactory https://www.jfrog.com/confluence/display/RTF/Scripted+Pipeline+Syntax
+                script {
+                    if (params.isReleaseCandidate == 'true') {
+                        def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+                        def downloadSpec = """{
+                            "files": [
+                                {
+                                "pattern": "${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}.zip", 
+                                "target": "./"
+                                }
+                            ]
+                        }"""
+                        server.download spec: downloadSpec
+                        // expand the .zip file, place in a new directory, apply the proper appsettings-<env>.json for the respective env and delete the rest, and push the files to the server
+                        powershell 'ping -n 4 10.135.6.20'
+                        powershell "Expand-Archive -Path ${WORKSPACE}\\${Application_Name}\\${version}\\${Application_Name}.zip -DestinationPath .\\Artifactory"
+                        powershell "Remove-Item .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.qa.json, .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.prod.json, .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.json"
+                        powershell "Rename-Item -Path .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.dev.json -NewName appsettings.json"
+                        powershell "dir .\\Artifactory\\${Framework_Build_Files_Path}"
+                        bat """powershell.exe -c "Remove-Item ${Dev_Framework_Server_Path}\\* -Force -Recurse"""
+                        bat """powershell.exe -c "Copy-Item .\\Artifactory\\${Framework_Build_Files_Path}\\* -Destination ${Dev_Framework_Server_Path}\\ -Force"""
+                    }
+                    else {
+                        def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+                        def downloadSpec = """{
+                            "files": [
+                                {
+                                "pattern": "${Artifactory_Bucket}/${Application_Name}-Local/0.0.1/${Application_Name}.zip", 
+                                "target": "./"
+                                }
+                            ]
+                        }"""
+                        server.download spec: downloadSpec
+                        // expand the .zip file, place in a new directory, apply the proper appsettings-<env>.json for the respective env and delete the rest, and push the files to the server
+                        powershell "Expand-Archive -Path ${WORKSPACE}\\${Application_Name}-Local\\0.0.1\\${Application_Name}.zip -DestinationPath .\\Artifactory -Force"
+                        powershell "Remove-Item .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.qa.json, .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.prod.json, .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.json"
+                        powershell "Rename-Item -Path .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.dev.json -NewName appsettings.json"
+                        powershell "dir .\\Artifactory\\${Framework_Build_Files_Path}"
+                        bat """powershell.exe -c "Remove-Item ${Dev_Framework_Server_Path}\\* -Force -Recurse"""
+                        bat """powershell.exe -c "Copy-Item .\\Artifactory\\${Framework_Build_Files_Path}\\* -Destination ${Dev_Framework_Server_Path}\\ -Force -Recurse"""
+                    }
+                }
+  	        }
+        }
+	stage('Git Tagging') {
+		when {
+                expression { params.environment == 'dev' && params.isReleaseCandidate == 'true' && versionExists == 'false' }
+            	}
+		steps {
+
+			bat "git checkout ${branch}"
+			bat "git config user.email \"${currentBuild.getBuildCauses()[0].userName}\""
+			bat "git config user.name \"${notifyEmail}\""
+			bat "git tag -a v${version} -m \"Jenkins Build # ${BUILD_NUMBER}\""
+				
+			withCredentials([usernamePassword(credentialsId: '66901246-9eff-4f83-8ed7-a68448d1f64b',
+					usernameVariable: 'username',
+					passwordVariable: 'password')]){
+				bat "git push https://$username:$password@github.com/PilotFlyingJ/${Application_Name}  v${version}"
+				}
+			}
+		}
+  	    // Pull down artifact from JFROG for qa automation tests
+        stage ('Deploy to QA') {
+            when {
+                expression { params.environment == 'qa' }
+            }
+            steps {
+                // documentation for artifactory https://www.jfrog.com/confluence/display/RTF/Scripted+Pipeline+Syntax
+                script {
+                    def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+                    def downloadSpec = """{
+                        "files": [
+                            {
+                            "pattern": "${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}.zip", 
+                            "target": "./"
+                            }
+                        ]
+                    }"""
+                    server.download spec: downloadSpec
+                }
+                // expand the .zip file, place in a new directory, apply the proper appsettings-<env>.json for the respective env and delete the rest, and push the files to the server
+                powershell "Expand-Archive -Path ${WORKSPACE}\\${Application_Name}\\${version}\\${Application_Name}.zip -DestinationPath .\\Artifactory"
+                powershell "Remove-Item .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.dev.json, .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.prod.json, .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.json"
+                powershell "Rename-Item -Path .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.qa.json -NewName appsettings.json"
+                powershell "dir .\\Artifactory\\${Framework_Build_Files_Path}"
+                bat """powershell.exe -c "Remove-Item ${QA_Framework_Server_Path}\\* -Force -Recurse"""
+                bat """powershell.exe -c "Copy-Item .\\Artifactory\\${Framework_Build_Files_Path}\\* -Destination ${Qa_Framework_Server_Path}\\ -Force"""
+            }
+  	    }
+
+        stage ('Deploy to Prod') {
+            when {
+                expression { params.environment == 'prod' && isReleaseCandidate == 'true'}
+            }
+            steps {
+                script {
+                    if (params.CM_Number != ''){
+                        echo "CM_Number exists: ${CM_Number}" 
+                    }
+                    else {
+                        error("CM_Number is required")
+                    }
+                }
+                // documentation for artifactory https://www.jfrog.com/confluence/display/RTF/Scripted+Pipeline+Syntax
+                script {
+                    def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+                    def downloadSpec = """{
+                        "files": [
+                            {
+                            "pattern": "${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}.zip", 
+                            "target": "./"
+                            }
+                        ]
+                    }"""
+                    server.download spec: downloadSpec
+                }
+                // expand the .zip file, place in a new directory, apply the proper appsettings-<env>.json for the respective env and delete the rest, and push the files to the server
+                powershell "Expand-Archive -Path ${WORKSPACE}\\${Application_Name}\\${version}\\${Application_Name}.zip -DestinationPath .\\Artifactory"
+                powershell "Remove-Item .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.dev.json, .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.qa.json, .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.json"
+                powershell "Rename-Item -Path .\\Artifactory\\${Framework_Build_Files_Path}\\appsettings.prod.json -NewName appsettings.json"
+                powershell "dir .\\Artifactory\\${Framework_Build_Files_Path}"
+                bat """powershell.exe -c "Remove-Item ${Prod_Framework_Server_Path}\\* -Force -Recurse"""
+                bat """powershell.exe -c "Copy-Item .\\Artifactory\\${Framework_Build_Files_Path}\\* -Destination ${Prod_Framework_Server_Path}\\ -Force"""
+            }
+        }
+    }
+    post {
+        success {
+            // send job complete email on success
+            emailext (
+                subject: "DEPLOYMENT COMPLETE: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                body: """SUCCESSFUL: Jenkins Job -- ${env.JOB_NAME} [${env.BUILD_NUMBER}]\n\nCheck the console output at https://dotnet-jenkins.pilotcorp.net:8443/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/console""",
+                to: "${email}",
+		    recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+            )
+        }
+        unstable {
+          // send job complete email on success
+          emailext (
+              subject: "DEPLOYMENT COMPLETE: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+              body: """Unstable: Jenkins Job -- ${env.JOB_NAME} [${env.BUILD_NUMBER}]\n\nCheck the Sonarqube scans results for code smells and possible solutions.""",
+              to: "${email}",
+		  recipientProviders: [requestor()]
+          )
+		script{
+              // send email to veracode
+                if(isEmailToVeracode==true)
+                {                   
+                  echo "Issuing Manual Veracode Scan to AppSec@pilottravelcenters.com "
+                  
+                  emailext (
+                      subject: "Scan request for ${Application_Name}'",
+                      body: """Repo URL: https://github.com/PilotFlyingJ/${Application_Name}.git \n\n Branch Name: ${branch} \n\n Current Version: ${version} \n\n  VeraCode File: https://pfjartifacts.pilotcorp.net:8443/artifactory/${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}-For-Veracode.zip""",
+                      to: "${securityEmail}"
+                  )
+                }            
+            }
+        }        
+        failure {
+            // send job failure email on failure
+            emailext (
+                subject: "DEPLOYMENT FAILURE: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                body: """BUILD MARKED AS FAILURE: Jenkins Job -- ${env.JOB_NAME} [${env.BUILD_NUMBER}]\n\nCheck the console output at https://dotnet-jenkins.pilotcorp.net:8443/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/console""",
+                to: "${email}",
+		    recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+            )
+        }
+	always {
+           cleanWs()
+        }
+    }
+}
