@@ -1,0 +1,80 @@
+pipeline {
+    agent { label 'windows' }
+		
+    environment {
+        // Establish env variables to be used in the job
+            ARTIFACTORY_CREDS = credentials('svcartifactorycicd')
+            def Application_Name = "fpp-retail-price-change-store-agent"
+            def Artifactory_Bucket = "Fuel-Profit-Platform"
+            def Artifactory_File = 'PriceExecutionStoreAgent.zip'
+            def Framework_Solution_File = 'PriceExecutionStoreAgent.sln'
+            def Core_Solution_File = 'PriceExecutionStoreAgent.sln'
+            def versionExists = 'false'
+            def StoreApiLocation = 'c$\\inetpub\\wwwroot\\PriceExecutionStoreAgent'
+            def BUILD_VERSION = """${sh(returnStdout: true,script:'if ${isReleaseCandidate} == "true"; then echo "${version}" | tr -d [:space:]; else echo "${version}-${BUILD_ID}" | tr -d [:space:]; fi')}"""
+    }
+
+    stages {
+        stage('Echo Environment Variables') {
+            steps {
+              echo "agent: ${env.AGENT}"
+              echo "environment: ${environment}"
+              echo "version: ${version}"
+              echo "repo: ${repo}"
+              echo "branch: ${branch}"
+              echo "isReleaseCandidate: ${isReleaseCandidate}"
+              echo "WORKSPACE: ${WORKSPACE}"
+              echo "BUILD_NUMBER: ${BUILD_NUMBER}"
+              echo "Application_name: ${Application_Name}"
+            }
+        }
+        //stage('Checkout Git Branch') {
+        //   steps {
+        //        checkout([$class: 'GitSCM', branches: [[name: '*/${branch}']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '66901246-9eff-4f83-8ed7-a68448d1f64b', url: 'https://github.com/PilotFlyingJ/${Application_Name}.git']]])            }      
+        //}
+
+        stage ('MSBuild dotnet build for release') {
+            steps {  
+                 //mkdir ${WORKSPACE}\Publish
+                 bat "nuget restore -SolutionDirectory ${WORKSPACE} -PackagesDirectory ${WORKSPACE}\\Packages -Source https://pfjartifacts.pilotcorp.net:8443/artifactory/api/nuget/PFJ-NuGet-Packages ${Framework_Solution_File}"
+		 bat """MSBuild.exe -property:Configuration=Release -property:OutputPath=${WORKSPACE}\\Publish ${Framework_Solution_File}"""
+            }
+        }
+        stage ('Publish to Artifactory IRC=True') {
+            steps {
+                // Documentation for artifactory https://www.jfrog.com/confluence/display/RTF/Scripted+Pipeline+Syntax
+                powershell "Compress-Archive -Path . -DestinationPath \"${WORKSPACE}\\${Artifactory_File}\" -Update"
+		     // veracode scan submission for both Core and Framework .dll files
+                powershell "Get-ChildItem -Path ${WORKSPACE}\\Publish\\ -Exclude Microsoft*, System* | Compress-Archive -DestinationPath ${WORKSPACE}\\${Application_Name}-For-Veracode.zip -Update"
+                script {
+                    def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+
+					echo "Uploading Veracode zip to Artifactory Store"                            
+                    def uploadSpecVCode = """{
+                        "files": [
+                            {
+                            "pattern": "${Application_Name}-For-Veracode.zip",
+                            "target": "${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}-For-Veracode.zip"
+                            }
+                        ]
+                    }"""
+                    server.upload spec: uploadSpecVCode
+                }
+            }    
+  	    }
+    
+        stage('Submit Veracode Scan') {
+            steps {
+              echo 'Zipping up project for submission to Veracode...'
+	      bat "nuget restore -SolutionDirectory ${WORKSPACE} -PackagesDirectory ${WORKSPACE}\\Packages -Source https://pfjartifacts.pilotcorp.net:8443/artifactory/api/nuget/PFJ-NuGet-Packages ${Framework_Solution_File}"
+	      bat """MSBuild.exe -property:Configuration=debug -property:OutputPath=${WORKSPACE}\\Publish ${Framework_Solution_File}"""
+              sh """zip -rv fpp-retail-price-change-store-agent-${BUILD_NUMBER}.zip .  """
+
+              echo 'Sending application package to Veracode...'
+              withCredentials([usernamePassword(credentialsId: 'veracode-credentials', passwordVariable: 'vpass', usernameVariable: 'vuser')]) {
+                veracode applicationName: 'fpp-retail-price-change-store-agent', canFailJob: true, criticality: 'VeryHigh', debug: true, fileNamePattern: '', replacementPattern: '', sandboxName: '', scanExcludesPattern: '', scanIncludesPattern: '', scanName: 'fpp-retail-price-change-store-agent-${BUILD_NUMBER}', teams: '', uploadExcludesPattern: '', uploadIncludesPattern: '*.zip', useIDkey: true, vid: vuser, vkey: vpass, vpassword: '', vuser: ''
+              }
+           }
+        }
+    }
+}
