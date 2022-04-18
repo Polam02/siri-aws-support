@@ -1,0 +1,291 @@
+pipeline {
+    agent { label 'windows' }
+
+    // creating environment variables to make jenkinsfile declarative
+    environment {
+        ARTIFACTORY_CREDS = credentials('svcartifactorycicd')
+        def Application_Name = "PriceExecutionMSMQRelay"
+        def Sonar_Key = "fpp-retail-price-change-MSMQ-relay-sonar"
+        def Sonar_Project = "fpp-retail-price-change-MSMQ-relay"
+        def Artifactory_Bucket = "Jenkins-DotNet-Artifacts"
+        def Artifactory_File = 'PriceExecutionMSMQRelay.zip'
+        def Framework_Solution_File = 'PriceExecutionMSMQRelay.sln'
+        def Core_Solution_File = 'PriceExecutionMSMQRelay.sln'
+        def versionExists = 'false'
+        def ApiLocation = "PFJ.PriceExecutionMSMQRelay.WebAPI"
+        def MSMQApiLocation = 'c$\\inetpub\\wwwroot\\PriceExecutionMSMQRelay'
+    }
+
+    // display all environment variables in jenkins console output
+    stages {
+
+        stage('Echo Environment Variables') {
+          steps {
+              echo "agent: ${env.AGENT}"
+              echo "environment: ${environment}"
+              echo "version: ${version}"
+              echo "repo: ${repo}"
+              //echo "branch: ${branch}"
+              echo "isReleaseCandidate: ${isReleaseCandidate}"
+              echo "WORKSPACE: ${WORKSPACE}"
+              echo "BUILD_NUMBER: ${BUILD_NUMBER}"
+              echo "Application_name: ${Application_Name}"
+            }
+        }
+
+        // Check if the build version has already been created. If so, fail the job. We don't want versions over-written
+        stage('Validate Build Version') {
+            when {
+                expression { "${params.environment}" == 'dev' && "${params.isReleaseCandidate}" == 'true' }
+            }
+            steps {
+                script {
+                    echo "${versionExists}"
+                    try {
+                        sh "curl -u'$ARTIFACTORY_CREDS_USR':'$ARTIFACTORY_CREDS_PSW' --fail --head 'https://pfjartifacts.pilotcorp.net:8443/artifactory/${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}.zip'"
+                        versionExists = 'true'
+                        echo "${versionExists}"
+                        echo "Version ${version} already exists. Skipping the rest of the stages and exiting..."
+                        currentBuild.result = 'FAILURE'
+                    }
+                    catch (exc) {
+                        echo "Version ${version} not found. Success"
+                    }
+                }
+            }
+        }
+
+       // SQ for code quality, MSBuild/dotnet debug build to verify solution is ready for deployment.
+        stage('Build and Code Quality Scan') {
+          when {
+                expression { "${params.environment}" == 'dev' || "${params.environment}" == 'qa' }
+            }
+          steps {
+                // send code to SonarQube for analysis
+                withSonarQubeEnv('SonarQube Prod') {
+                    bat "SonarScanner.MSBuild.exe begin /k:${Sonar_Key} /n:${Sonar_Project} /v:${Sonar_Project}-${BUILD_NUMBER} /d:sonar.host.url=%SONAR_HOST_URL% /d:sonar.login=%SONAR_AUTH_TOKEN%"
+                    bat "nuget restore -SolutionDirectory ${WORKSPACE} -PackagesDirectory ${WORKSPACE}\\Packages -Source https://pfjartifacts.pilotcorp.net:8443/artifactory/api/nuget/PFJ-NuGet-Packages ${Framework_Solution_File}"
+                    //bat """MSBuild.exe -property:Configuration=Release ${Framework_Solution_File}"""
+                    // Using this MSBuild to use the JenkinsPublish file to have the publish binaries in jenkins workspace.
+                    bat """MSBuild.exe ${Framework_Solution_File} /nologo /nr:false /p:DeployOnBuild=true /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:platform=\"any cpu\" /p:configuration=Release /p:PublishProfile=JenkinsPublish"""
+                    bat "SonarScanner.MSBuild.exe end /d:sonar.login=%SONAR_AUTH_TOKEN%"
+                }
+
+                sleep(60)
+
+                timeout(time: 1, unit: 'HOURS') { // Just in case something goes wrong, pipeline will be killed after a timeout
+                    script {
+                        def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
+                             
+                        if (qg.status != 'OK') {
+                            if(params.isReleaseCandidate=="true")
+                            {
+                                //to block next stage and show graphical box as red
+                                error "Quality Gate for code scan failure: ${qg.status}" 
+                            }
+                            else
+                            {
+                                //to non-block next stage and show graphical box as yellow (unstable)
+                                unstable("Quality Gate for code scan failure: ${qg.status}")
+                            }
+                        }
+                    }
+                }          
+            }
+        }
+
+        stage('Upload to Artifactory') {
+            when {
+                expression { "${params.environment}" == 'dev' }
+            }
+            steps {
+                // Zip up code package for Artifactory, including all env web.config files
+                powershell """Get-ChildItem -Path \"${WORKSPACE}\\${ApiLocation}\\obj\\Release\\Publish\" | Compress-Archive -DestinationPath \"${WORKSPACE}\\${Artifactory_File}\" -Update"""
+
+                // Upload to Artifactory
+                // documentation for artifactory https://www.jfrog.com/confluence/display/RTF/Scripted+Pipeline+Syntax
+                script {
+                    if("${params.isReleaseCandidate}" == 'true' && versionExists == 'false'){
+                        def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+                        def uploadSpec = """{
+                            "files": [
+                                {
+                                "pattern": "${Artifactory_File}",
+                                "target": "${Artifactory_Bucket}/${Application_Name}/${version}/${Artifactory_File}"
+                                }
+                            ]
+                        }"""
+                        server.upload spec: uploadSpec
+                    }
+                    else{
+                        echo "Not uploading to Artifactory. Deploying local code to dev server"
+                    }
+                }                    
+            }
+        }
+        
+        // Deploy Code and Create IIS Service to KNXPRICEMSMQ01T, KNXPRICEMSMQ02T, OKCPRICEMSMQ01T 
+        stage('Deploy to DEV') {
+            when {
+                expression { "${params.environment}" == 'dev' && env.JOB_NAME == 'fpp-retail-price-change-MSMQ-relay-dev' }
+            }
+            steps {
+                // Expand the .zip file to send over to the server                
+                powershell "Expand-Archive -Path ${WORKSPACE}\\${Artifactory_File} -DestinationPath .\\BuildDownload -Force"
+                // Deploy to KNXPRICEMSMQ01T using Release Artifact from Artifactory
+                bat """
+                    powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ01T.pilotcorp.net" -ScriptBlock { Stop-WebAppPool -Name "DefaultAppPool" }
+                    powershell.exe -c "Copy-Item .\\BuildDownload\\* -Destination \\\\KNXPRICEMSMQ01T\\${MSMQApiLocation} -Force -Recurse"
+                    powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ01T.pilotcorp.net" -ScriptBlock { Start-WebAppPool -Name "DefaultAppPool" }"
+                    """
+                
+                // Deploy to KNXPRICEMSMQ02T using Release Artifact from Artifactory
+                bat """
+                    powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ02T.pilotcorp.net" -ScriptBlock { Stop-WebAppPool -Name "DefaultAppPool" }"
+                    powershell.exe -c "Copy-Item .\\BuildDownload\\* -Destination \\\\KNXPRICEMSMQ02T\\${MSMQApiLocation} -Force -Recurse"
+                    powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ02T.pilotcorp.net" -ScriptBlock { Start-WebAppPool -Name "DefaultAppPool" }"
+                    """
+                
+                // Deploy to OKCPRICEMSMQ01T using Release Artifact from Artifactory
+                bat """
+                    powershell.exe -c "Invoke-Command -ComputerName "OKCPRICEMSMQ01T.pilotcorp.net" -ScriptBlock { Stop-WebAppPool -Name "DefaultAppPool" }"
+                    powershell.exe -c "Copy-Item .\\BuildDownload\\* -Destination \\\\OKCPRICEMSMQ01T\\${MSMQApiLocation} -Force -Recurse"
+                    powershell.exe -c "Invoke-Command -ComputerName "OKCPRICEMSMQ01T.pilotcorp.net" -ScriptBlock { Start-WebAppPool -Name "DefaultAppPool" }"
+                    """  
+            }
+        }
+
+        // Deploy Code and Create IIS Service to KNXPRICEMSMQ01Q, KNXPRICEMSMQ02Q, OKCPRICEMSMQ01Q 
+        stage('Deploy to QA') {
+            when {
+                  expression { "${params.environment}" == 'qa' && env.JOB_NAME == 'fpp-retail-price-change-MSMQ-relay-qa' }
+            }
+            steps {
+                script {
+                    // Download package from Artifactory
+                    def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+                    def downloadSpec = """{
+                      "files": [
+                          {
+                          "pattern": "${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}.zip",
+                          "target": "./"
+                          }
+                      ]
+                    }"""
+                    server.download spec: downloadSpec
+
+                    // Use PowerShell to copy the application package to the target system
+                    powershell "Expand-Archive -Path ${WORKSPACE}\\${Application_Name}\\${version}\\${Application_Name}.zip -DestinationPath .\\BuildDownload -Force"
+
+                    // Copy files over to KNXPRICEMSMQ01Q Server
+                    bat """
+                      powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ01Q.pilotcorp.net" -ScriptBlock { Stop-WebAppPool -Name "DefaultAppPool" }"
+                      powershell.exe -c "Copy-Item .\\BuildDownload\\* -Destination \\\\KNXPRICEMSMQ01Q\\${MSMQApiLocation} -Force -Recurse"
+                      powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ01Q.pilotcorp.net" -ScriptBlock { Start-WebAppPool -Name "DefaultAppPool" }"
+                      """
+                    
+                    // Copy files over to KNXPRICEMSMQ02Q Server
+                    bat """
+                      powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ02Q.pilotcorp.net" -ScriptBlock { Stop-WebAppPool -Name "DefaultAppPool" }"
+                      powershell.exe -c "Copy-Item .\\BuildDownload\\* -Destination \\\\KNXPRICEMSMQ02Q\\${MSMQApiLocation} -Force -Recurse"
+                      powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ02Q.pilotcorp.net" -ScriptBlock { Start-WebAppPool -Name "DefaultAppPool" }"
+                      """
+                    
+                    // Copy files over to OKCPRICEMSMQ01Q Server
+                    bat """
+                      powershell.exe -c "Invoke-Command -ComputerName "OKCPRICEMSMQ01Q.pilotcorp.net" -ScriptBlock { Stop-WebAppPool -Name "DefaultAppPool" }"
+                      powershell.exe -c "Copy-Item .\\BuildDownload\\* -Destination \\\\OKCPRICEMSMQ01Q\\${MSMQApiLocation} -Force -Recurse"
+                      powershell.exe -c "Invoke-Command -ComputerName "OKCPRICEMSMQ01Q.pilotcorp.net" -ScriptBlock { Start-WebAppPool -Name "DefaultAppPool" }"
+                      """
+                }
+            } 
+        }
+        
+        stage('Submit Veracode Scan') {
+            when {
+                expression { env.JOB_NAME == 'FPP-Relay-Nightly' && "${params.isReleaseCandidate}" == 'true' && versionExists == 'false' }
+            }
+            steps {
+                // TODO: Confirm that the path listed below to obtain the dlls is the workspace location in jenkins.  To confirm path, comment the Clean WS()
+                
+                // zipping up code for veracode scan
+                powershell "dir ${WORKSPACE}\\${ApiLocation}\\bin\\"
+                powershell "Get-ChildItem -Path ${WORKSPACE}\\${ApiLocation}\\bin\\*.dll -Exclude Microsoft*, System* | Compress-Archive -DestinationPath ${WORKSPACE}\\Veracode-PriceExecutionMSMQRelay.zip -Update"
+
+                withCredentials([usernamePassword(credentialsId: 'veracode-credentials', passwordVariable: 'vpass', usernameVariable: 'vuser')]) {
+                    veracode applicationName: 'PriceExecutionMSMQRelay', canFailJob: true, criticality: 'VeryHigh', debug: true, fileNamePattern: '', replacementPattern: '', sandboxName: '', scanExcludesPattern: '', scanIncludesPattern: '', scanName: '${buildnumber}', teams: '', uploadExcludesPattern: '', uploadIncludesPattern: 'Veracode-PriceExecutionMSMQRelay.zip', useIDkey: true, vid: vuser, vkey: vpass, vpassword: '', vuser: ''
+                }
+            }
+        }
+
+        // Deploy Code and Create IIS Service to KNXPRICEMSMQ01, KNXPRICEMSMQ02, OKCPRICEMSMQ01 
+        stage('Deploy to PROD') {
+            when {
+                  expression { "${params.environment}" == 'prod' && env.JOB_NAME == 'fpp-retail-price-change-MSMQ-relay-prod' }
+            }
+            steps {
+                script {
+                    // Download package from Artifactory
+                    def server = Artifactory.newServer url: 'https://pfjartifacts.pilotcorp.net:8443/artifactory/', credentialsId: 'svcartifactorycicd'
+                    def downloadSpec = """{
+                      "files": [
+                          {
+                          "pattern": "${Artifactory_Bucket}/${Application_Name}/${version}/${Application_Name}.zip",
+                          "target": "./"
+                          }
+                      ]
+                    }"""
+                    server.download spec: downloadSpec
+
+                    // Use PowerShell to copy the application package to the target system
+                    powershell "Expand-Archive -Path ${WORKSPACE}\\${Application_Name}\\${version}\\${Application_Name}.zip -DestinationPath .\\BuildDownload -Force"
+
+                    // Copy files over to KNXPRICEMSMQ01 Server
+                    bat """
+                      powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ01.pilotcorp.net" -ScriptBlock { Stop-WebAppPool -Name "DefaultAppPool" }"
+                      powershell.exe -c "Copy-Item .\\BuildDownload\\* -Destination \\\\KNXPRICEMSMQ01\\${MSMQApiLocation} -Force -Recurse"
+                      powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ01.pilotcorp.net" -ScriptBlock { Start-WebAppPool -Name "DefaultAppPool" }"
+                      """
+                    
+                    // Copy files over to KNXPRICEMSMQ02 Server
+                    bat """
+                      powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ02.pilotcorp.net" -ScriptBlock { Stop-WebAppPool -Name "DefaultAppPool" }"
+                      powershell.exe -c "Copy-Item .\\BuildDownload\\* -Destination \\\\KNXPRICEMSMQ02\\${MSMQApiLocation} -Force -Recurse"
+                      powershell.exe -c "Invoke-Command -ComputerName "KNXPRICEMSMQ02.pilotcorp.net" -ScriptBlock { Start-WebAppPool -Name "DefaultAppPool" }"
+                      """
+                    
+                    // Copy files over to OKCPRICEMSMQ01 Server
+                    bat """
+                      powershell.exe -c "Invoke-Command -ComputerName "OKCPRICEMSMQ01.pilotcorp.net" -ScriptBlock { Stop-WebAppPool -Name "DefaultAppPool" }"
+                      powershell.exe -c "Copy-Item .\\BuildDownload\\* -Destination \\\\OKCPRICEMSMQ01\\${MSMQApiLocation} -Force -Recurse"
+                      powershell.exe -c "Invoke-Command -ComputerName "OKCPRICEMSMQ01.pilotcorp.net" -ScriptBlock { Start-WebAppPool -Name "DefaultAppPool" }"
+                      """
+                }
+            }
+        }
+    }   
+    post {
+        success {
+            // send job complete email on success
+            emailext (
+                subject: "PriceExecutionMSMQRelay Deployment Complete! Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                body: """SUCCESSFUL: Jenkins Job -- ${env.JOB_NAME} [${env.BUILD_NUMBER}]\n\nCheck the console output at https://jenkins.pilotcorp.net:8443/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/console\n\n""",
+                to: "${params.emailNotifications}"
+            )
+        }
+
+        failure {
+            // send job failure email on failure
+            emailext (
+                subject: "PriceExecutionMSMQRelay Deployment Marked As Failure! Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                body: """BUILD MARKED AS FAILURE: Jenkins Job -- ${env.JOB_NAME} [${env.BUILD_NUMBER}]\n\nCheck the console output at https://jenkins.pilotcorp.net:8443/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/console\n\n""",
+                to: "${params.emailNotifications}"
+            )
+        }
+
+        always {
+            cleanWs()
+        }
+    }
+    
+}
